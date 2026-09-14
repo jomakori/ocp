@@ -9,6 +9,7 @@ import { getDb, getDbPath, createKey, listKeys, LIST_KEYS_SQL, validateKey, reco
 import { isLoopbackBind } from "./lib/net.mjs";
 import { classifyToolRequest, countDeclaredTools } from "./lib/tool-support.mjs";
 import { isUpstreamRateLimit, retryAfterSeconds } from "./lib/upstream-errors.mjs";
+import { listUnhonouredFields, CACHE_KEY_ONLY } from "./lib/unhonoured-fields.mjs";
 import { validateTools, extractBridgeToolUses, toolUsesToOpenAI, renderToolTurn, endsWithToolResult, TOOL_CONTINUATION_NOTE, TOOL_PREFIX as TC_PREFIX, buildBridgeConfig } from "./lib/tool-calling.mjs";
 import { PREFIX as BRIDGE_PREFIX } from "./lib/mcp-bridge.mjs";
 import { randomBytes } from "node:crypto";
@@ -6408,6 +6409,108 @@ ltTest("integration (#479): in multi mode a BRIDGE spawn gets the neutral wrappe
       const argv2 = ltArgvCalls(argvFile);
       assert.ok(!argv2.includes("--mcp-config"), `premise: no bridge on the plain spawn — ${JSON.stringify(argv2.slice(-8))}`);
     } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "multi-wrapper", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+console.log("\nFields OCP accepts and does not act on (#470):");
+
+test("#470: a field is listed only when the client asked for something it is not getting", () => {
+  // Nothing sent, nothing to report.
+  assert.deepEqual(listUnhonouredFields({}), []);
+  assert.deepEqual(listUnhonouredFields(null), []);
+  assert.deepEqual(listUnhonouredFields("not an object"), []);
+
+  // THE DEFAULTS ARE HONOURED, and reporting them would make this fire on clients that are getting
+  // exactly what they asked for -- which is how a signal becomes noise and then gets ignored.
+  assert.deepEqual(listUnhonouredFields({ n: 1 }), [], "n:1 IS what OCP returns");
+  assert.deepEqual(listUnhonouredFields({ stop: [] }), [], "an empty stop list asks for nothing");
+  assert.deepEqual(listUnhonouredFields({ logprobs: false }), [], "logprobs:false is the default");
+  assert.deepEqual(listUnhonouredFields({ parallel_tool_calls: true }), [],
+    "parallel calls ARE delivered as of #478 — this one became honoured, and the list must follow");
+
+  // ...and the same fields at a non-default value are not.
+  assert.deepEqual(listUnhonouredFields({ n: 3 }), ["n"]);
+  assert.deepEqual(listUnhonouredFields({ stop: ["END"] }), ["stop"]);
+  assert.deepEqual(listUnhonouredFields({ logprobs: true, top_logprobs: 5 }), ["logprobs", "top_logprobs"]);
+  assert.deepEqual(listUnhonouredFields({ parallel_tool_calls: false }), ["parallel_tool_calls"],
+    "asking OCP to SERIALISE calls is the half that still goes unmet");
+
+  // Several at once, sorted, so a log line is stable to read and to assert on.
+  assert.deepEqual(listUnhonouredFields({ max_tokens: 50, seed: 7, temperature: 0.2 }),
+    ["max_tokens", "seed", "temperature"]);
+
+  // The three that are not wholly inert: they reach cacheHash and nothing else.
+  assert.deepEqual([...CACHE_KEY_ONLY].sort(), ["max_tokens", "temperature", "top_p"]);
+});
+
+// The WIRING PIN, and the reason this list can be trusted a year from now. The claim is not "these
+// fields are ignored" -- that is prose. It is "no value of these fields reaches the spawn", which a
+// live boot can read off the argv the server really passed. Implement one of them without removing
+// it from the list and this reddens.
+ltTest("integration (#470): the listed fields reach NEITHER the argv NOR the prompt, and the request is counted", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const argvFile = join(dir, "argv.txt");
+  const stdinFile = join(dir, "stdin.txt");
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, ARGV_CAPTURE: argvFile, STDIN_CAPTURE: stdinFile }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const SENTINEL = "ZZSTOPZZ";
+      const r = await ltPostStatus(port, {
+        model: "sonnet", messages: [{ role: "user", content: "hi" }],
+        temperature: 0.2, top_p: 0.9, max_tokens: 50, max_completion_tokens: 60,
+        seed: 7, stop: [SENTINEL], logprobs: true, top_logprobs: 3,
+        presence_penalty: 1, frequency_penalty: 1, n: 3,
+      });
+      assert.equal(r.status, 200, `an inert field must not turn into a refusal — ${r.text.slice(0, 200)}`);
+      // The spec's own answer for n>1 is n choices; OCP returns one. Asserting it pins WHY the
+      // field is on the list rather than taking the list's word for it.
+      assert.equal(JSON.parse(r.text).choices.length, 1, "n:3 is reported, not honoured");
+
+      const argv = ltArgvCalls(argvFile);
+      assert.ok(argv.length > 0, `no argv captured — ${ltDiag(buf)}`);
+      // POSITIVE anchor before any absence claim (#405): a known-present element proves the capture
+      // is this request's and not an empty world satisfying every negative.
+      assert.ok(argv.includes("--output-format"), `premise: a real argv — ${JSON.stringify(argv.slice(0, 6))}`);
+      for (const f of ["--temperature", "--top-p", "--max-tokens", "--seed", "--stop", "--logprobs"]) {
+        assert.ok(!argv.includes(f), `${f} must not appear — the CLI has no such flag: ${JSON.stringify(argv)}`);
+      }
+      // And not smuggled into the prompt either, which is the other way a value could reach the
+      // model. The sentinel is a string only this request sent.
+      assert.ok(await ltWait(() => _ltExists(stdinFile)), "no stdin captured");
+      assert.ok(!_ltRead(stdinFile, "utf8").includes(SENTINEL),
+        `a stop sequence must not be smuggled into the prompt — ${_ltRead(stdinFile, "utf8").slice(0, 300)}`);
+
+      const h = await fetch(`http://127.0.0.1:${port}/health`).then(x => x.json());
+      assert.equal(h.stats.unhonouredFieldRequests, 1, "one REQUEST, whatever the field count");
+      assert.ok(await ltWait(() => /"event":"openai_fields_not_honoured"/.test(buf.out)),
+        `and named in the log at info — ${buf.out.slice(-400)}`);
+      const line = buf.out.split("\n").filter((l) => l.includes("openai_fields_not_honoured")).pop();
+      assert.match(line, /"cacheKeyOnly":\["max_tokens","temperature","top_p"\]/,
+        `the three cache-key-only fields must be called out separately — ${line}`);
+      // info, not warn: a dropped tool kills an agent loop, an ignored temperature degrades one
+      // answer, and warning on most traffic would drown warn_count (#304).
+      assert.ok(!/"level":"warn"[^\n]*openai_fields_not_honoured/.test(buf.err),
+        `must NOT be a warn — ${buf.err.slice(-300)}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "unhonoured", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+ltTest("integration (#470 control): a request sending only honoured fields is NOT counted", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      // n:1 and an empty stop are the interesting half: present in the body, asking for nothing.
+      const r = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }], n: 1, stop: [] });
+      assert.equal(r.status, 200, r.text.slice(0, 200));
+      const h = await fetch(`http://127.0.0.1:${port}/health`).then(x => x.json());
+      assert.equal(h.stats.unhonouredFieldRequests, 0,
+        "a request getting what it asked for must not be counted, or the number stops meaning anything");
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "unhonoured-control", 5000); }
   } finally { _ltRmRetry(dir); }
 });
 

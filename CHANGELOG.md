@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### Added
+
+- **OCP now says which OpenAI fields it did not act on (#470).** `tools` was never the only one. Measured: `n: 3` returns one choice, `logprobs` produces no `logprobs`, and `seed` / `stop` / `max_completion_tokens` have no effect — all `HTTP 200`, all silent. `temperature`, `top_p` and `max_tokens` are read too, but **only by `cacheHash`**: they partition the cache without steering the sampler, which is a different thing from "ignored" and is reported separately as `cacheKeyOnly` rather than folded in.
+
+  **They are not fields someone forgot to wire.** Checked against `claude --help` on 2.1.270: there is no `--max-tokens`, `--stop`, `--seed`, `--temperature` or `--top-p`. The only budget-shaped flags are `--max-budget-usd` (a **dollar** cap, not a token cap) and `--autocompact` (the **context** window, not the output). Honouring them would mean OCP post-processing the model's output — a different decision from this one.
+
+  So this is #468's answer for the rest of the fields: **a counter and a log, not a refusal.** A client that sends `temperature: 0` out of habit must still get an answer; `400`-ing it would break working integrations to make a point. What changes is that the silence is countable and greppable.
+
+  **`/health` gains `stats.unhonouredFieldRequests`** — additive under [ADR 0012](docs/adr/0012-additive-fields-on-grandfathered-b2.md), B.2, read-only. Counts **requests, not fields**: a request sending three inert fields moves it by one, the same discipline `toolRequestsDropped` uses. Snapshot diff **+2 / −0**, one line per profile.
+
+  Logged at **`info`, not `warn`**, and that is not timidity: a dropped `tools` kills an agent's loop, while an ignored `temperature` degrades one answer — and many clients send `temperature` on every call, so warning here would fire on most traffic and drown the `warn_count` signal #304 made load-bearing. A guard that fires on everything is worth nothing.
+
+  **Defaults are not reported**, because reporting them is how a signal becomes noise: `n: 1`, `stop: []`, `logprobs: false` and `parallel_tool_calls: true` are all *honoured* — the last one only since #478 — and a client sending them is getting exactly what it asked for. Only `parallel_tool_calls: false`, which asks OCP to serialise calls, still goes unmet.
+
+  The list is pinned **behaviourally**, not as prose: one live boot sends every listed field and asserts none of them reaches the spawn's argv **or** the prompt (a `stop` sentinel is searched for in the captured stdin), with a positive anchor first so the absence claims cannot be satisfied by an empty capture. Implement one of these fields without removing it from the list and that test reddens. Mutation rows: count fields instead of requests → red; report `n: 1` too → red; log at `warn` → red; stop classifying at all → red.
+
+
 
 ## v3.36.0 — 2026-09-14
 
