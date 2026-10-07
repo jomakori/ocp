@@ -49,6 +49,7 @@ import { isLoopbackBind } from "./lib/net.mjs";
 import { parseAllowedHosts, parseAuthority, matchesDeclared, evaluateOriginGate } from "./lib/host-gate.mjs";
 import { classifyToolRequest, countDeclaredTools } from "./lib/tool-support.mjs";
 import { isUpstreamRateLimit, retryAfterSeconds } from "./lib/upstream-errors.mjs";
+import { classifyRateLimitEvent, classifyUpstreamOutcome, recordUpstreamOutcome, upstreamStatusSnapshot } from "./lib/upstream-status.mjs";
 import { validateTools, extractBridgeToolUses, extractAssistantText, toolUsesToOpenAI, renderToolTurn,
          endsWithToolResult, TOOL_CONTINUATION_NOTE, TOOL_PREFIX, buildBridgeConfig } from "./lib/tool-calling.mjs";
 import { runTuiTurn, reapStaleTuiSessions, resolveTuiHome, bootTuiPane, tuiPaneHealthy, poolPaneName, killLiveTurnPanes, POOL_BOOT_MS } from "./lib/tui/session.mjs";
@@ -1186,6 +1187,8 @@ const stats = {
   queued: 0,           // current requests waiting for a -p concurrency slot (FIX ⑥)
   queueRejections: 0,  // total requests rejected with HTTP 429 because the wait-queue was full (FIX ⑥)
 };
+// Per-process, latest completed upstream outcome only. Deliberately no history/body is retained.
+const upstreamOutcome = { outcome: null, observedAt: null };
 const recentErrors = []; // last 20 errors
 
 // Per-model request stats
@@ -2176,6 +2179,11 @@ async function callClaude(model, messages, conversationId, keyName, res, opts = 
   // Mirrors callClaudeStreaming's flag of the same name: an is_error result is a PROTOCOL
   // failure with a zero exit code, so the close handler cannot see it from `code` alone.
   let errored = false;
+  // The strongest upstream failure signal seen THIS request — the structured rate-limit frame, or
+  // an is_error result message. It is captured at the arm that sees it and RECORDED at the single
+  // terminal point below, so one request writes the field once and a synthesized `claude exit 0`
+  // can never overwrite a wall that was read correctly.
+  let upstreamFailure = null;
   // FIX ⑥: acquire a concurrency slot first (queues up to CLAUDE_MAX_QUEUE; rejects with a
   // ConcurrencyOverflowError → 429 when the queue is full, or a RequestDisconnectedError (F2)
   // if the client goes away first). The release fn is passed into the spawn so the idempotent
@@ -2305,6 +2313,15 @@ async function callClaude(model, messages, conversationId, keyName, res, opts = 
       const { events, remainder } = parseStreamJsonLines(lineBuffer);
       lineBuffer = remainder;
       for (const event of events) {
+        // The CLI's structured rate-limit frame carries the upstream's own ratelimit headers, and
+        // parseStreamJsonEvent consumes it (returns null) because it is not content. It is read
+        // here, where the payload is still in hand, because it is the one place a quota rejection
+        // is stated as DATA rather than as prose. A `rejected` status is the wall; an `allowed`
+        // frame is ordinary traffic and records nothing.
+        if (event?.type === "rate_limit_event") {
+          const limited = classifyRateLimitEvent(event);
+          if (limited) upstreamFailure = limited;
+        }
         const parsed = parseStreamJsonEvent(event, sawTextDelta);
         if (!parsed) continue;
         if (parsed.toolUses) {
@@ -2363,6 +2380,12 @@ async function callClaude(model, messages, conversationId, keyName, res, opts = 
           resultEventSeen = true;
         } else if (parsed.error) {
           // is_error result — treat as process error.
+          const eventError = String(parsed.error);
+          // CAPTURED, not recorded: this arm sets `errored`, so the close handler below takes its
+          // error branch for the SAME request. Recording here and there would write one request
+          // twice, and the second write — built from possibly-empty stderr — would overwrite a
+          // wall this arm read correctly with `other`. One terminal point per request.
+          if (upstreamFailure === null) upstreamFailure = classifyUpstreamOutcome(eventError);
           //
           // #460: `errored` is set here for the same reason callClaudeStreaming sets it, and its
           // absence on THIS lane was the whole defect. The child exits 0 (an is_error result is a
@@ -2431,12 +2454,20 @@ async function callClaude(model, messages, conversationId, keyName, res, opts = 
         recordModelSuccess(cliModel, elapsed);
         breakerRecordSuccess(cliModel);
         noteAuthVerifiedByRequest();
+        // A tool-call turn IS a completed upstream success — the model answered. Without this the
+        // field would keep reporting the previous request's outcome for a healthy agentic turn.
+        recordUpstreamOutcome(upstreamOutcome, "success");
         logEvent("info", "claude_ok", { model: cliModel, chars: toolText.length, elapsed, toolCalls: toolCalls.length, session: convId ? convId.slice(0, 12) + "..." : "none" });
         resolve({ toolCalls, text: toolText });
         return;
       }
       if ((code !== 0 && !resultEventSeen) || errored) {
         recordModelError(cliModel, false);
+        const errorMessage = stderr.slice(0, 300) || assembledText.slice(0, 300) || `claude exit ${code}`;
+        // The structured frame or the is_error message wins over a synthesized `claude exit 0`:
+        // when the CLI reports the wall as a result event stderr is empty and `errorMessage` names
+        // no condition, so this precedence is what keeps `usage_limited` from becoming `other`.
+        recordUpstreamOutcome(upstreamOutcome, upstreamFailure ?? classifyUpstreamOutcome(errorMessage));
         logEvent("error", "claude_exit", { model: cliModel, code, signal: signal || "none", elapsed, errored, stderr: stderr.slice(0, 300) });
         countError(stderr.slice(0, 300) || assembledText.slice(0, 300) || `claude exit ${code}`);
         handleSessionFailure();
@@ -2444,6 +2475,7 @@ async function callClaude(model, messages, conversationId, keyName, res, opts = 
       } else {
         recordModelSuccess(cliModel, elapsed);
         breakerRecordSuccess(cliModel);
+        recordUpstreamOutcome(upstreamOutcome, "success");
         noteAuthVerifiedByRequest(); // #308: a completed request is conclusive evidence the credential works
         logEvent("info", "claude_ok", { model: cliModel, chars: assembledText.length, elapsed, session: convId ? convId.slice(0, 12) + "..." : "none" });
         resolve(assembledText);
@@ -2617,7 +2649,8 @@ async function callClaudeTui(model, messages, _conversationId, _keyName, res, st
     const banner = detectTuiUpstreamError(text);
     if (banner) {
       logEvent("error", "tui_upstream_error", { model: cliModel, banner: banner.slice(0, 200) });
-      throw new Error("tui_upstream_error: claude CLI returned an in-session error banner instead of an answer");
+      recordUpstreamOutcome(upstreamOutcome, classifyUpstreamOutcome(banner));
+      throw new Error("tui_upstream_error: claude CLI returned an in-session error banner instead of an answer", { cause: new Error(banner) });
     }
 
     // ── Streaming safety net — the transcript is the authority, the deltas are the mirror.
@@ -2674,6 +2707,7 @@ async function callClaudeTui(model, messages, _conversationId, _keyName, res, st
     }
 
     recordModelSuccess(cliModel, 0); // elapsed not measurable here; wallclock at reader level
+    recordUpstreamOutcome(upstreamOutcome, "success");
     // #361: a completed request is conclusive evidence the credential works — ADR 0014 § C states
     // that rule for "a request that reaches the model and succeeds", unqualified by lane, and the
     // TUI lanes simply never called it. That made ADR 0014's whole premise inapplicable in TUI
@@ -2722,6 +2756,9 @@ async function callClaudeTui(model, messages, _conversationId, _keyName, res, st
       stats.timeouts++;
     }
     recordModelError(cliModel, timedOut);
+    const tuiMessage = String(err?.message || err);
+    const tuiBanner = tuiMessage.startsWith("tui_upstream_error:") ? String(err?.cause?.message || "") : "";
+    if (!tuiBanner) recordUpstreamOutcome(upstreamOutcome, classifyUpstreamOutcome(tuiMessage));
     // ADR 0018: the headline of #361 — a failed TUI turn is a failure OF THE PROXY, and until now
     // it reached no aggregate counter at all. Deliberately placed AFTER the TuiAbortError branch
     // above (which returns), so it inherits that branch's already-correct exclusion of client
@@ -2939,6 +2976,9 @@ async function callClaudeStreaming(model, messages, conversationId, res, authInf
   // If errored===true the close handler must not cache the response or record success
   // (mirrors callClaude which rejects and never caches on is_error).
   let errored = false;
+  // See callClaude's twin: captured at the arm that sees the signal, recorded once at the
+  // terminal point below.
+  let upstreamFailure = null;
   // ONE request must move the counter by at most one. Both streaming error arms can fire for a
   // single failure -- the is_error arm sets `errored`, which is exactly what makes the close
   // handler take its error branch too -- so a wall that appears in the result event AND on stderr
@@ -2979,6 +3019,12 @@ async function callClaudeStreaming(model, messages, conversationId, res, authInf
     lineBuffer = remainder;
 
     for (const event of events) {
+      // See callClaude's twin: the structured rate-limit frame is the authoritative quota signal
+      // and parseStreamJsonEvent drops it, so it is read here.
+      if (event?.type === "rate_limit_event") {
+        const limited = classifyRateLimitEvent(event);
+        if (limited) upstreamFailure = limited;
+      }
       const parsed = parseStreamJsonEvent(event, sawTextDelta);
       if (!parsed) continue;
 
@@ -3025,6 +3071,9 @@ async function callClaudeStreaming(model, messages, conversationId, res, authInf
         // cause the close handler to record success + write cache). Set errored instead.
         errored = true;
         const errStr = String(parsed.error);
+        // CAPTURED here, RECORDED once at the terminal point below — this arm sets `errored`, so
+        // the close handler takes its error branch for the same request.
+        if (upstreamFailure === null) upstreamFailure = classifyUpstreamOutcome(errStr);
         logEvent("error", "claude_result_error", { model: cliModel, error: errStr.slice(0, 200) });
         countError(errStr.slice(0, 200));
         // Classified and COUNTED here even though the status is already 200 -- see
@@ -3069,6 +3118,8 @@ async function callClaudeStreaming(model, messages, conversationId, res, authInf
     // never record success or write cache for an errored response.
     if ((code !== 0 && !resultEventSeen) || errored) {
       recordModelError(cliModel, false);
+      const errorMessage = stderr || assembledText || `claude exit ${code}`;
+      recordUpstreamOutcome(upstreamOutcome, upstreamFailure ?? classifyUpstreamOutcome(errorMessage));
       try { recordUsage({ keyId: authInfo.keyId, keyName: authInfo.keyName, model, promptChars: messages.reduce((a, m) => a + contentToText(m.content).length, 0), responseChars: 0, elapsedMs: elapsed, success: false }); } catch (e) { logEvent("error", "usage_record_failed", { error: e.message }); }
       logEvent("error", "claude_exit", { model: cliModel, code, signal: signal || "none", elapsed, errored, stderr: stderr.slice(0, 300) });
       countError(stderr.slice(0, 300) || `claude exit ${code}`);
@@ -3090,6 +3141,7 @@ async function callClaudeStreaming(model, messages, conversationId, res, authInf
     } else {
       recordModelSuccess(cliModel, elapsed);
       breakerRecordSuccess(cliModel);
+      recordUpstreamOutcome(upstreamOutcome, "success");
       try { recordUsage({ keyId: authInfo.keyId, keyName: authInfo.keyName, model, promptChars: messages.reduce((a, m) => a + contentToText(m.content).length, 0), responseChars: totalChars, elapsedMs: elapsed, success: true }); } catch (e) { logEvent("error", "usage_record_failed", { error: e.message }); }
       noteAuthVerifiedByRequest(); // #308: a completed request is conclusive evidence the credential works
       logEvent("info", "claude_ok", { model: cliModel, chars: totalChars, elapsed, session: convId ? convId.slice(0, 12) + "..." : "none" });
@@ -3916,6 +3968,7 @@ async function handleStatus(_req, res) {
     proxy: {
       status: proxyHealthStatus(binaryOk),
       version: VERSION,
+      upstream: upstreamStatusSnapshot(upstreamOutcome),
       uptime: `${Math.floor(uptimeMs / 3600000)}h ${Math.floor((uptimeMs % 3600000) / 60000)}m`,
       auth: (() => { const a = effectiveAuthStatus(); return a.ok ? "ok" : a.message; })(),
     },
@@ -4978,6 +5031,7 @@ async function handleRequest(req, res) {
       authMode: AUTH_MODE,
       ...((isLocalhost || ADVERTISE_ANON_KEY) ? { anonymousKey: PROXY_ANONYMOUS_KEY || null } : {}),
       auth: effectiveAuthStatus(), // #308: the TTL on a request-verified verdict is applied at read time
+      upstream: upstreamStatusSnapshot(upstreamOutcome),
       // #327: empty string rather than omitted, so a consumer can tell "primary" from "an older
       // build that does not report this at all" — the same distinction #324's backward-compat
       // test turned on.

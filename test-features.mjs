@@ -9,6 +9,7 @@ import { getDb, getDbPath, createKey, listKeys, LIST_KEYS_SQL, validateKey, reco
 import { isLoopbackBind } from "./lib/net.mjs";
 import { classifyToolRequest, countDeclaredTools } from "./lib/tool-support.mjs";
 import { isUpstreamRateLimit, retryAfterSeconds } from "./lib/upstream-errors.mjs";
+import { classifyRateLimitEvent, classifyUpstreamOutcome, recordUpstreamOutcome, upstreamStatusSnapshot, UPSTREAM_OUTCOMES } from "./lib/upstream-status.mjs";
 import { validateTools, extractBridgeToolUses, toolUsesToOpenAI, renderToolTurn, endsWithToolResult, TOOL_CONTINUATION_NOTE, TOOL_PREFIX as TC_PREFIX, buildBridgeConfig } from "./lib/tool-calling.mjs";
 import { PREFIX as BRIDGE_PREFIX } from "./lib/mcp-bridge.mjs";
 import { randomBytes } from "node:crypto";
@@ -2905,6 +2906,13 @@ if [ -n "$TOOLS_CAPTURE" ]; then
     fi
     prev="$a"
   done
+fi
+# A STRUCTURED rate-limit frame with no prose of its own. It is the outcome module's authority
+# source for usage/quota, and this env var exists to pin that server.mjs actually CONSULTS it: paired
+# with a GENERIC UPSTREAM_ERROR below, the frame alone is what makes the recorded outcome
+# usage_limited rather than other. Emitted before the failure, as the real CLI emits it.
+if [ -n "$UPSTREAM_RATE_LIMIT_EVENT" ]; then
+  printf '%s\n' '{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"five_hour","overageStatus":"rejected","overageDisabledReason":"out_of_credits"}}'
 fi
 if [ -n "$UPSTREAM_ERROR" ]; then
   # A failing spawn whose message is whatever the test wants, delivered the way a real failure
@@ -6205,6 +6213,101 @@ test("upstream rate limit: Retry-After is read from the message or omitted, neve
   assert.equal(retryAfterSeconds(`resets_at: ${Math.floor(now / 1000) - 9999}; try again in 10 minutes`, now), 600);
 });
 
+test("upstream outcome: categories come from real CLI/proxy text; the frame is authoritative; status ages to stale explicitly", () => {
+  // The vocabulary is pinned against the module's own export, so the strings below cannot silently
+  // describe a category the module no longer defines (this test previously asserted the wrong names).
+  assert.deepEqual(UPSTREAM_OUTCOMES, ["success", "auth_rejected", "usage_limited", "other"]);
+
+  // The OBSERVED wall strings (#481): the CLI's `usage limit` prose and the vendor's out-of-credits
+  // text must both land in usage_limited — the condition a fallback-capable client fails over on and
+  // the one an operator must NOT answer by renewing OAuth.
+  assert.equal(classifyUpstreamOutcome("rate_limit_error: usage limit reached"), "usage_limited");
+  assert.equal(classifyUpstreamOutcome("Claude usage limit reached - resets at 7:00am"), "usage_limited");
+  assert.equal(classifyUpstreamOutcome("Out of credits. Add credits to continue."), "usage_limited");
+  assert.equal(classifyUpstreamOutcome("API Error: 403 This request would exceed your organization's rate limit"), "usage_limited");
+  // A CONCLUSIVE auth rejection, and only these shapes — OAuth renewal is the remedy only here.
+  assert.equal(classifyUpstreamOutcome("Failed to authenticate. API Error: 401 Invalid authentication credentials"), "auth_rejected");
+  assert.equal(classifyUpstreamOutcome("authentication_error: invalid bearer token"), "auth_rejected");
+  // Positive signal or nothing: prose that names no condition is `other`, never a guess. This is the
+  // control for the frame test below — the same message WITHOUT a structured frame stays `other`.
+  assert.equal(classifyUpstreamOutcome("socket hang up"), "other");
+  assert.equal(classifyUpstreamOutcome("claude exited unexpectedly"), "other");
+  assert.equal(classifyUpstreamOutcome("upstream rejected the request"), "other");
+  assert.equal(classifyUpstreamOutcome(""), "other");
+  assert.equal(classifyUpstreamOutcome(null), "other");
+
+  // The structured `rate_limit_event` is the authority for usage/quota. Only a REJECTED status
+  // counts: the CLI emits the same frame on ordinary allowed traffic, and recording that would make
+  // the field useless. Both wire spellings of the payload key are accepted.
+  assert.equal(classifyRateLimitEvent({ rate_limit_info: { status: "rejected" } }), "usage_limited");
+  assert.equal(classifyRateLimitEvent({ rate_limit_info: { status: "allowed" } }), null);
+  assert.equal(classifyRateLimitEvent({ rate_limit_info: { status: "rejected", rateLimitType: "five_hour", overageStatus: "rejected", overageDisabledReason: "out_of_credits" } }), "usage_limited");
+  assert.equal(classifyRateLimitEvent({ rateLimitInfo: { overageDisabledReason: "out_of_credits" } }), "usage_limited");
+  assert.equal(classifyRateLimitEvent({ rate_limit_info: { status: "allowed", overageDisabledReason: null } }), null);
+  assert.equal(classifyRateLimitEvent({}), null);
+  assert.equal(classifyRateLimitEvent(null), null);
+
+  const state = { outcome: null, observedAt: null };
+  assert.deepEqual(upstreamStatusSnapshot(state, 1000), { outcome: "unobserved", observedAt: null, stale: false });
+  recordUpstreamOutcome(state, "success", 1000);
+  assert.deepEqual(upstreamStatusSnapshot(state, 1001), { outcome: "success", observedAt: new Date(1000).toISOString(), stale: false });
+  assert.equal(upstreamStatusSnapshot(state, 1000 + 15 * 60 * 1000).stale, false);
+  assert.equal(upstreamStatusSnapshot(state, 1000 + 15 * 60 * 1000 + 1).stale, true);
+  assert.equal(upstreamStatusSnapshot(state, 999).stale, true, "clock moving behind evidence must fail stale");
+  // A recorder that accepted an unknown category would let a typo ship as a value the snapshot's
+  // consumers cannot read; it fails loudly instead.
+  assert.throws(() => recordUpstreamOutcome(state, "usage_limit"), /invalid upstream outcome/);
+});
+
+// THE FIELD'S WHOLE LIFECYCLE, through a real server: `unobserved` before any request settles, then
+// the outcome of the last completed turn, published identically on both surfaces. A unit test cannot
+// prove the server wires the recorder at the terminal points or reads it out on both endpoints.
+ltTest("integration: /health.upstream is unobserved before any request, then reports the last turn's success", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      // A boot-only `claude auth status` probe (checkAuth) must NOT count as a request: the field
+      // reads `unobserved` until real inference traffic settles.
+      const before = await fetch(`http://127.0.0.1:${port}/health`).then(x => x.json());
+      assert.deepEqual(before.upstream, { outcome: "unobserved", observedAt: null, stale: false },
+        "before any request the field must be a first-class `unobserved`, not a missing key");
+      const r = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }] });
+      assert.equal(r.status, 200, `— ${r.text.slice(0, 200)}`);
+      const after = await fetch(`http://127.0.0.1:${port}/health`).then(x => x.json());
+      assert.equal(after.upstream.outcome, "success", JSON.stringify(after.upstream));
+      assert.equal(after.upstream.stale, false);
+      assert.ok(!Number.isNaN(Date.parse(after.upstream.observedAt)), `observedAt must be an ISO timestamp — got ${after.upstream.observedAt}`);
+      // One reading, two surfaces — a consumer can read either.
+      const status = await fetch(`http://127.0.0.1:${port}/status`).then(x => x.json());
+      assert.deepEqual(status.proxy.upstream, after.upstream, "/status.proxy.upstream must mirror /health.upstream");
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "upstream-success", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+// THE STRUCTURED FRAME IS THE AUTHORITY, and this is the only test that pins the server CONSULTING
+// it. The prose here ("upstream rejected the request") names no condition and classifies as `other`
+// on its own — the unit test above asserts exactly that. The recorded `usage_limited` can therefore
+// come only from the `rate_limit_event` frame, which is the source lib/upstream-status.mjs trusts
+// for quota. The HTTP status is a SEPARATE classification (lib/upstream-errors.mjs, from the message
+// alone, unchanged by this change) and is deliberately not asserted here; the subject is the field.
+ltTest("integration: a structured rejected rate_limit_event records usage_limited over generic prose", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, UPSTREAM_ERROR: "upstream rejected the request", UPSTREAM_RATE_LIMIT_EVENT: "1" }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }] });
+      const h = await fetch(`http://127.0.0.1:${port}/health`).then(x => x.json());
+      assert.equal(h.upstream.outcome, "usage_limited",
+        `the frame must win over unrecognised prose — got ${JSON.stringify(h.upstream)}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "upstream-frame", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
 // The whole point, end to end: a real server.mjs, a spawn that fails with a wall message, and the
 // STATUS a client would branch on. A source-level check would not catch respondUpstreamError being
 // bypassed on one of the two paths that reach it.
@@ -6222,6 +6325,7 @@ ltTest("integration: an upstream quota wall reaches the client as 429 rate_limit
       assert.match(body.error.message, /usage limit/i, "the message must still say what happened");
       const h = await fetch(`http://127.0.0.1:${port}/health`).then(x => x.json());
       assert.equal(h.stats.upstreamRateLimits, 1, "the wall must be counted separately from errors");
+      assert.equal(h.upstream.outcome, "usage_limited", "and the last-outcome field must name the wall, so a consumer need not parse prose");
       assert.ok(await ltWait(() => /"event":"upstream_rate_limit"/.test(buf.err)), `and logged — ${buf.err.slice(-300)}`);
     } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "upstream-429", 5000); }
   } finally { _ltRmRetry(dir); }
@@ -6241,6 +6345,7 @@ ltTest("integration (control): an ordinary spawn failure is still 500 proxy_erro
       assert.equal(JSON.parse(r.text).error.type, "proxy_error");
       const h = await fetch(`http://127.0.0.1:${port}/health`).then(x => x.json());
       assert.equal(h.stats.upstreamRateLimits, 0, "an ordinary failure must NOT be counted as a rate limit");
+      assert.equal(h.upstream.outcome, "other", "and an unmatched failure is `other`, never guessed into the wall");
     } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "upstream-500", 5000); }
   } finally { _ltRmRetry(dir); }
 });
