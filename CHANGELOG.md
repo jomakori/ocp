@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+
+- **Additive under ADR 0012:** `/health.upstream` and `/status.proxy.upstream` expose latest real Claude CLI outcome (#DEV-51), with fields `upstream`, `upstream.outcome`, `upstream.observedAt`, and `upstream.stale` (`proxy.upstream` equivalents on `/status`). Outcomes are `success`, `auth_rejected`, `usage_limited`, `other`, or `unobserved`. Status comes only from actual inference outcomes; no synthetic provider calls or error text/bodies are retained.
+
 
 ## v3.36.0 — 2026-09-14
 
