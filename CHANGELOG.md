@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## v3.43.0 — 2026-10-09
+
+### Added
+
+- **Additive under [ADR 0012](docs/adr/0012-additive-fields-on-grandfathered-b2.md):** `/health.upstream` and `/status.proxy.upstream` expose the latest real Claude CLI outcome. Exact response fields: `upstream`, `upstream.outcome`, `upstream.observedAt`, `upstream.stale`, `proxy.upstream`, `proxy.upstream.outcome`, `proxy.upstream.observedAt`, `proxy.upstream.stale`. Outcomes: `success`, `auth_rejected`, `usage_limited`, `other`, or `unobserved`. Observations come from actual inference requests; no synthetic probes or error bodies are retained. README § API Endpoints.
+
 ## v3.42.0 — 2026-09-29
 
 ### Added
